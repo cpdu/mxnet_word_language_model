@@ -1,1 +1,1 @@
-A same implementation for [pytorch official language model example ](https://github.com/pytorch/examples/tree/master/word_language_model) on Mxnet.
+The model can be trained in distributed mode with multiple GPUs on a single machine. Option --num-gpu represents the number of GPUs you want to use for training. Option --kv-store can be set to 'local' or 'device'. Refer to [official docs](https://mxnet.incubator.apache.org/api/python/kvstore/kvstore.html#mxnet.kvstore.create) for details.

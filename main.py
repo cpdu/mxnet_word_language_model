@@ -23,7 +23,7 @@ parser.add_argument('--lr', type=float, default=20,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=10,
+parser.add_argument('--epochs', type=int, default=1,
                     help='upper epoch limit')
 parser.add_argument('--batch_size', type=int, default=20,
                     help='batch size')
@@ -33,10 +33,12 @@ parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
 parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
-parser.add_argument('--cuda', action='store_true',
-                    help='use CUDA')
-parser.add_argument('--log-interval', type=int, default=50, metavar='N',
+parser.add_argument('--num-gpu', type=int, default=0,
+                    help='number of GPUs')
+parser.add_argument('--log-interval', type=int, default=20, metavar='N',
                     help='report interval')
+parser.add_argument('--kv-store', type=str,  default='local',
+                    help='kvstore type')
 parser.add_argument('--save', type=str,  default='model.pt',
                     help='path to save the final model')
 args = parser.parse_args()
@@ -45,15 +47,15 @@ args = parser.parse_args()
 mx.random.seed(args.seed)
 
 # try to use GPU
-if args.cuda:
+if args.num_gpu:
     try:
-        context = mx.gpu()
-        _ = nd.array([0], ctx=context)
+        context = [mx.gpu(i) for i in range(args.num_gpu)]
+        for c in context:
+            _ = nd.array([0], ctx=c)
     except:
-        raise RuntimeError("You have no cuda devices while using --cuda.")
+        raise RuntimeError("You don't have {:d} available GPUs.".format(args.num_gpu))
 else:
-    context = mx.cpu()
-
+    context = [mx.cpu()]
 
 # load data
 corpus = data.Corpus(args.data)
@@ -66,69 +68,81 @@ def batchify(data, batch_size):
     data = data.reshape((batch_size, num_batches)).T
     return data
 
-train_data = batchify(corpus.train, args.batch_size).as_in_context(context)
-val_data = batchify(corpus.valid, args.batch_size).as_in_context(context)
-test_data = batchify(corpus.test, args.batch_size).as_in_context(context)
+# split data according to context
+train_data = gluon.utils.split_and_load(batchify(corpus.train, args.batch_size), context, batch_axis=1)
+val_data = gluon.utils.split_and_load(batchify(corpus.valid, args.batch_size), context, batch_axis=1)
+test_data = gluon.utils.split_and_load(batchify(corpus.test, args.batch_size), context, batch_axis=1)
 
+# create a model and initialize
 model = model.RNNModel(args.model, vocab_size, args.emsize, args.nhid, args.nlayers, args.dropout)
 model.initialize(ctx=context)
-trainer = gluon.Trainer(model.collect_params(), 'sgd', {'learning_rate': args.lr, 'momentum': 0, 'wd': 0})
+trainer = gluon.Trainer(model.collect_params(),
+                        optimizer='sgd',
+                        optimizer_params={'learning_rate': args.lr},
+                        kvstore=args.kv_store)
 criterion = gluon.loss.SoftmaxCrossEntropyLoss()
 
 def detach(hidden):
     if isinstance(hidden, (tuple, list)):
-        hidden = [i.detach() for i in hidden]
+        hidden = [i.detach() if not isinstance(i, list) else detach(i) for i in hidden]
     else:
         hidden = hidden.detach()
     return hidden
 
 def get_batch(source, i):
-    seq_len = min(args.bptt, source.shape[0] - 1 - i)
-    data = source[i : i + seq_len]
-    target = source[i + 1 : i + 1 + seq_len]
-    return data, target.reshape((-1,))
+    seq_len = min(args.bptt, source[0].shape[0] - 1 - i)
+    data = [x[i : i + seq_len] for x in source]
+    target = [x[i + 1 : i + 1 + seq_len].reshape((-1,)) for x in source]
+    return data, target
 
 def evaluate(data_source):
     total_loss = 0.0
     ntotal = 0
-    hidden = model.begin_state(func = mx.nd.zeros, batch_size = args.batch_size,
-                               ctx=context)
-    for i in range(0, data_source.shape[0] - 1, args.bptt):
+    hidden = [model.begin_state(func=mx.nd.zeros, batch_size=args.batch_size // len(context), ctx=ctx) for ctx in context]
+    for i in range(0, data_source[0].shape[0] - 1, args.bptt):
         data, target = get_batch(data_source, i)
-        output, hidden = model(data, hidden)
-        loss = criterion(output, target)
-        total_loss += mx.nd.sum(loss).asscalar()
-        ntotal += loss.size
+        losses = [criterion(model(d, h)[0], t) for d, h, t in zip(data, hidden, target)]
+        loss = 0
+        for l in losses:
+            loss += mx.nd.sum(l).asscalar()
+        total_loss += loss
+        ntotal += losses[0].size * len(context)
     return total_loss / ntotal
 
 def train():
     total_loss = 0.0
     start_time = time.time()
-    hidden = model.begin_state(func=mx.nd.zeros, batch_size=args.batch_size, ctx=context)
-    for batch, i in enumerate(range(0, train_data.shape[0] - 1, args.bptt)):
+    hidden = [model.begin_state(func=mx.nd.zeros, batch_size=args.batch_size // len(context), ctx=ctx) for ctx in context]
+    for batch, i in enumerate(range(0, train_data[0].shape[0] - 1, args.bptt)):
         data, target = get_batch(train_data, i)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = detach(hidden)
         with autograd.record():
-            output, hidden = model(data, hidden)
-            loss = criterion(output, target)
-        loss.backward()
+            losses = [criterion(model(d, h)[0], t) for d, h, t in zip(data, hidden, target)]
+        for l in losses:
+            l.backward()
 
-        grads = [p.grad(context) for p in model.collect_params().values()]
+        # sum over losses on each context
+        loss = 0
+        for l in losses:
+            loss += mx.nd.sum(l).asscalar()
+        total_loss += loss / args.bptt / args.batch_size
+
         # grad clipping helps prevent the exploding gradient problem in RNNs / LSTMs.
-        gluon.utils.clip_global_norm(grads, args.clip * args.bptt * args.batch_size)
+        for c in context:
+            grads = [p.grad(c) for p in model.collect_params().values()]
+            gluon.utils.clip_global_norm(grads, args.clip * args.bptt * args.batch_size / len(context))
+
+        # automatically average gradients in trainer.step
         trainer.step(args.bptt * args.batch_size)
-        total_loss += mx.nd.sum(loss).asscalar() / loss.shape[0]
 
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
-            # print('[Epoch %d Batch %d / %d] loss %.2f, perplexity %.2f' % (
-            #     epoch + 1, batch, len(train_data) // args.bptt, cur_loss, math.exp(cur_loss)))
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} '
                   '| ms/batch {:5.2f} | loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch + 1, batch, len(train_data) // args.bptt, lr,
+                epoch + 1, batch, len(train_data[0]) // args.bptt, lr,
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
             total_loss = 0.0
             start_time = time.time()
