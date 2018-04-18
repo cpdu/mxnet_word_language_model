@@ -124,8 +124,6 @@ def train():
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
-            # print('[Epoch %d Batch %d / %d] loss %.2f, perplexity %.2f' % (
-            #     epoch + 1, batch, len(train_data) // args.bptt, cur_loss, math.exp(cur_loss)))
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} '
                   '| ms/batch {:5.2f} | loss {:5.2f} | ppl {:8.2f}'.format(
                 epoch + 1, batch, len(train_data) // args.bptt, lr,
