@@ -1,7 +1,9 @@
+import os
+import mxnet as mx
+
 import math
 import time
 import argparse
-import mxnet as mx
 import mxnet.ndarray as nd
 from mxnet import gluon, autograd
 
@@ -33,27 +35,54 @@ parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
 parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
-parser.add_argument('--cuda', action='store_true',
-                    help='use CUDA')
-parser.add_argument('--log-interval', type=int, default=50, metavar='N',
+parser.add_argument('--deviceid', type=int, default=0,
+                    help='device(GPU) id')
+parser.add_argument('--npush', type=int, default=8,
+                    help='gradient push interval')
+parser.add_argument('--npull', type=int, default=24,
+                    help='parameter pull interval')
+parser.add_argument('--log-interval', type=int, default=2, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str,  default='model.pt',
                     help='path to save the final model')
+parser.add_argument('--ip', type=str, default='127.0.0.1',
+                    help='scheduler IP')
+parser.add_argument('--port', type=str, default='9000',
+                    help='scheduler port')
+parser.add_argument('--num-server', type=str, default='1',
+                    help='number of servers')
+parser.add_argument('--num-worker', type=str, default='1',
+                    help='number of workers')
+parser.add_argument('--verbose', type=str, default='0',
+                    help='log verbose')
+parser.add_argument('--kv-store', type=str,  default='dist_async',
+                    help='kvstore type')
 args = parser.parse_args()
 
 # Set the random seed manually for reproducibility.
 mx.random.seed(args.seed)
 
 # try to use GPU
-if args.cuda:
-    try:
-        context = mx.gpu()
-        _ = nd.array([0], ctx=context)
-    except:
-        raise RuntimeError("You have no cuda devices while using --cuda.")
-else:
-    context = mx.cpu()
+deviceid = args.deviceid
+try:
+    context = mx.gpu(deviceid)
+    _ = nd.array([0], ctx=context)
+except:
+    raise RuntimeError("You have only {:d} GPU(s).".format(deviceid))
 
+# configure distributed training env
+os.environ.update({"DMLC_ROLE": "worker",
+                   "DMLC_PS_ROOT_URI": args.ip,
+                   "DMLC_PS_ROOT_PORT": args.port,
+                   "DMLC_NUM_SERVER": args.num_server,
+                   "DMLC_NUM_WORKER": args.num_worker,
+                   "PS_VERBOSE": args.verbose})
+
+# create kvstore and set its optimizer
+kv = mx.kv.create(args.kv_store)
+if kv.rank == 0:
+    optim = mx.optimizer.SGD(learning_rate=args.lr)
+    kv.set_optimizer(optim)
 
 # load data
 corpus = data.Corpus(args.data)
@@ -72,6 +101,8 @@ test_data = batchify(corpus.test, args.batch_size).as_in_context(context)
 
 model = model.RNNModel(args.model, vocab_size, args.emsize, args.nhid, args.nlayers, args.dropout)
 model.initialize(ctx=context)
+for i, p in enumerate(model.collect_params().values()):
+    kv.init(i, p.data())
 trainer = gluon.Trainer(model.collect_params(), 'sgd', {'learning_rate': args.lr, 'momentum': 0, 'wd': 0})
 criterion = gluon.loss.SoftmaxCrossEntropyLoss()
 
@@ -91,8 +122,7 @@ def get_batch(source, i):
 def evaluate(data_source):
     total_loss = 0.0
     ntotal = 0
-    hidden = model.begin_state(func = mx.nd.zeros, batch_size = args.batch_size,
-                               ctx=context)
+    hidden = model.begin_state(func = mx.nd.zeros, batch_size = args.batch_size, ctx=context)
     for i in range(0, data_source.shape[0] - 1, args.bptt):
         data, target = get_batch(data_source, i)
         output, hidden = model(data, hidden)
@@ -101,63 +131,88 @@ def evaluate(data_source):
         ntotal += loss.size
     return total_loss / ntotal
 
-def train():
+def train(offset):
     total_loss = 0.0
     start_time = time.time()
     hidden = model.begin_state(func=mx.nd.zeros, batch_size=args.batch_size, ctx=context)
-    for batch, i in enumerate(range(0, train_data.shape[0] - 1, args.bptt)):
-        data, target = get_batch(train_data, i)
+    param_num = len(model.collect_params().values())
+    total_grads = [0] * param_num
+    for batch, i in enumerate(range(0, train_data.shape[0] // kv.num_workers - 1, args.bptt)):
+        data, target = get_batch(train_data, i+offset)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = detach(hidden)
+
         with autograd.record():
             output, hidden = model(data, hidden)
             loss = criterion(output, target)
         loss.backward()
-
-        grads = [p.grad(context) for p in model.collect_params().values()]
-        # grad clipping helps prevent the exploding gradient problem in RNNs / LSTMs.
-        gluon.utils.clip_global_norm(grads, args.clip * args.bptt * args.batch_size)
-        trainer.step(args.bptt * args.batch_size)
         total_loss += mx.nd.sum(loss).asscalar() / loss.shape[0]
 
-        if batch % args.log_interval == 0 and batch > 0:
+        # grad clipping helps prevent the exploding gradient problem in RNNs / LSTMs.
+        rescale = args.bptt * args.batch_size
+        grads = [p.grad(context) for p in model.collect_params().values()]
+        gluon.utils.clip_global_norm(grads, args.clip * rescale)
+
+        # update local model
+        trainer.step(rescale)
+
+        # push gradients to server(kvstore) every `npush` batches
+        total_grads = [orig + new / rescale for orig, new in zip(total_grads, grads)]
+        if batch % args.npush == 0 and batch != 0:
+            for j, grad in enumerate(total_grads):
+                kv.push(j, grad, priority=-j)
+            total_grads = [0] * param_num
+
+        # pull parameters from server(kvstore) every `npull` batches
+        if batch % args.npull == 0 and batch != 0:
+            for j, p in enumerate(model.collect_params().values()):
+                kv.pull(j, p.data(), priority=-j)
+
+
+        if kv.rank == 0 and batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} '
                   '| ms/batch {:5.2f} | loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch + 1, batch, len(train_data) // args.bptt, lr,
+                epoch + 1, batch, len(train_data) // args.bptt // kv.num_workers, lr,
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
             total_loss = 0.0
             start_time = time.time()
 
 lr = args.lr
 best_val_loss = None
+data_part = kv.rank
+data_len = len(train_data)
 for epoch in range(args.epochs):
     epoch_start_time = time.time()
-    train()
+    train(data_part * data_len // kv.num_workers)
     training_time = time.time() - epoch_start_time
+    data_part = (data_part + 1) % kv.num_workers
 
-    val_loss = evaluate(val_data)
-    print('-' * 89)
-    print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | valid ppl {:8.2f}'.format(
-        epoch + 1, training_time, val_loss, math.exp(val_loss)))
-    print('-' * 89)
+    if kv.rank == 0:
+        val_loss = evaluate(val_data)
+        print('-' * 89)
+        print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | valid ppl {:8.2f}'.format(
+            epoch + 1, training_time, val_loss, math.exp(val_loss)))
+        print('-' * 89)
 
-    # Save the model if the validation loss is the best we've seen so far.
-    if not best_val_loss or val_loss < best_val_loss:
-        model.save_params(args.save)
-        best_val_loss = val_loss
-    else:
-        # Anneal the learning rate if no improvement has been seen in the validation dataset.
-        lr /= 4.0
-        trainer.set_learning_rate(lr)
+        # Save the model if the validation loss is the best we've seen so far.
+        if not best_val_loss or val_loss < best_val_loss:
+            model.save_params(args.save)
+            best_val_loss = val_loss
+        else:
+            # Anneal the learning rate if no improvement has been seen in the validation dataset.
+            lr /= 4.0
+            optim.set_learning_rate(lr)
+            kv.set_optimizer(optim)
 
-# Load the best saved model.
-model.load_params(args.save, context)
-# Run on test data.
-test_loss = evaluate(test_data)
+if kv.rank == 0:
+    # Load the best saved model.
+    model.load_params(args.save, context)
+    # Run on test data.
+    test_loss = evaluate(test_data)
 
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
-print('=' * 89)
+    print('=' * 89)
+    print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
+    print('=' * 89)
