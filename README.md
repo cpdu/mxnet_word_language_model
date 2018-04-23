@@ -1,1 +1,1 @@
-Implement ASGD algorithm for distributed training.
+Implement model averaging algorithm for distributed training.

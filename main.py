@@ -37,10 +37,8 @@ parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--deviceid', type=int, default=0,
                     help='device(GPU) id')
-parser.add_argument('--npush', type=int, default=8,
-                    help='gradient push interval')
-parser.add_argument('--npull', type=int, default=24,
-                    help='parameter pull interval')
+parser.add_argument('--navg', type=int, default=20,
+                    help='model average interval')
 parser.add_argument('--log-interval', type=int, default=2, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str,  default='model.pt',
@@ -55,7 +53,7 @@ parser.add_argument('--num-worker', type=str, default='1',
                     help='number of workers')
 parser.add_argument('--verbose', type=str, default='0',
                     help='log verbose')
-parser.add_argument('--kv-store', type=str,  default='dist_async',
+parser.add_argument('--kv-store', type=str,  default='dist_sync',
                     help='kvstore type')
 args = parser.parse_args()
 
@@ -81,7 +79,7 @@ os.environ.update({"DMLC_ROLE": "worker",
 # create kvstore and set its optimizer
 kv = mx.kv.create(args.kv_store)
 if kv.rank == 0:
-    optim = mx.optimizer.SGD(learning_rate=args.lr)
+    optim = mx.optimizer.SGD(learning_rate=-1/kv.num_workers, wd=-kv.num_workers)
     kv.set_optimizer(optim)
 
 # load data
@@ -157,15 +155,10 @@ def train(offset):
         # update local model
         trainer.step(rescale)
 
-        # push gradients to server(kvstore) every `npush` batches
-        total_grads = [orig + new / rescale for orig, new in zip(total_grads, grads)]
-        if batch % args.npush == 0 and batch != 0:
-            for j, grad in enumerate(total_grads):
-                kv.push(j, grad, priority=-j)
-            total_grads = [0] * param_num
-
-        # pull parameters from server(kvstore) every `npull` batches
-        if batch % args.npull == 0 and batch != 0:
+        # avarage parameters from each workers
+        if batch % args.navg == 0 and batch != 0:
+            for j, p in enumerate(model.collect_params().values()):
+                kv.push(j, p.data(), priority=-j)
             for j, p in enumerate(model.collect_params().values()):
                 kv.pull(j, p.data(), priority=-j)
 

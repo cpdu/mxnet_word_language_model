@@ -6,9 +6,8 @@ rank=0
 ip=127.0.0.1
 port=9000
 verbose=0
-npush=8
-npull=24
-kvstore=dist_async
+navg=20
+kvstore=dist_sync
 
 # training parameters
 epoch=10
@@ -51,8 +50,8 @@ do
     python3 -u main.py --deviceid ${i} --data ${data} --model ${model} --emsize ${emsize} \
                        --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} \
                        --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} \
-                       --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --npush ${npush} \
-                       --npull ${npull} --kv-store ${kvstore} --ip ${ip} --port ${port} \
+                       --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --navg ${navg} \
+                       --kv-store ${kvstore} --ip ${ip} --port ${port} \
                        --num-server ${num_workers} --num-worker ${num_workers} --verbose ${verbose} &
     rank=$(($rank+1))
     i=$(($i+1))
@@ -63,6 +62,6 @@ python3 -u server.py --role server --ip ${ip} --port ${port} --num-server ${num_
 python3 -u main.py --deviceid ${i} --data ${data} --model ${model} --emsize ${emsize} \
                    --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} \
                    --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} \
-                   --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --npush ${npush} \
-                   --npull ${npull} --kv-store ${kvstore} --ip ${ip} --port ${port} \
+                   --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --navg ${navg} \
+                   --kv-store ${kvstore} --ip ${ip} --port ${port} \
                    --num-server ${num_workers} --num-worker ${num_workers} --verbose ${verbose}
