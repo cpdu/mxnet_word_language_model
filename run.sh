@@ -24,6 +24,7 @@ nvidia-smi
 hostname
 echo $CUDA_VISIBLE_DEVICES
 
+batch_size=`expr $batch_size \* $num_gpu`
 python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} \
                    --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} \
                    --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} \
