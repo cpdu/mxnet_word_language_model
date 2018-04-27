@@ -39,6 +39,8 @@ parser.add_argument('--deviceid', type=int, default=0,
                     help='device(GPU) id')
 parser.add_argument('--navg', type=int, default=20,
                     help='model average interval')
+parser.add_argument('--ita', type=float, default=0.1,
+                    help='block momentum coefficient')
 parser.add_argument('--log-interval', type=int, default=2, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str,  default='model.pt',
@@ -99,10 +101,14 @@ test_data = batchify(corpus.test, args.batch_size).as_in_context(context)
 
 model = model.RNNModel(args.model, vocab_size, args.emsize, args.nhid, args.nlayers, args.dropout)
 model.initialize(ctx=context)
-for i, p in enumerate(model.collect_params().values()):
-    kv.init(i, p.data())
 trainer = gluon.Trainer(model.collect_params(), 'sgd', {'learning_rate': args.lr, 'momentum': 0, 'wd': 0})
 criterion = gluon.loss.SoftmaxCrossEntropyLoss()
+
+# init kvstore values
+for i, p in enumerate(model.collect_params().values()):
+    kv.init(i, p.data())
+lr_key = i+1
+kv.init(lr_key, nd.zeros((1)))
 
 def detach(hidden):
     if isinstance(hidden, (tuple, list)):
@@ -129,12 +135,26 @@ def evaluate(data_source):
         ntotal += loss.size
     return total_loss / ntotal
 
+# ensure all models are identical at the beginning
+for j, p in enumerate(model.collect_params().values()):
+    kv.push(j, p.data(), priority=-j)
+for j, p in enumerate(model.collect_params().values()):
+    kv.pull(j, p.data(), priority=-j)
+
+# about block momentum
+p_old = []
+p_new = []
+delta_t = []
+for p in model.collect_params().values():
+    p_old.append(p.data().copy())
+    p_new.append(nd.ones(p.shape, ctx=context))
+    delta_t.append(nd.zeros(p.shape, ctx=context))
+
 def train(offset):
     total_loss = 0.0
     start_time = time.time()
     hidden = model.begin_state(func=mx.nd.zeros, batch_size=args.batch_size, ctx=context)
     param_num = len(model.collect_params().values())
-    total_grads = [0] * param_num
     for batch, i in enumerate(range(0, train_data.shape[0] // kv.num_workers - 1, args.bptt)):
         data, target = get_batch(train_data, i+offset)
         # Starting each batch, we detach the hidden state from how it was previously produced.
@@ -160,8 +180,10 @@ def train(offset):
             for j, p in enumerate(model.collect_params().values()):
                 kv.push(j, p.data(), priority=-j)
             for j, p in enumerate(model.collect_params().values()):
-                kv.pull(j, p.data(), priority=-j)
-
+                kv.pull(j, p_new[j], priority=-j)
+                delta_t[j][:] = args.ita * delta_t[j] + (p_new[j] - p_old[j])
+                p.set_data(p_old[j] + delta_t[j])
+                p_old[j][:] = p_new[j]
 
         if kv.rank == 0 and batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
@@ -197,8 +219,14 @@ for epoch in range(args.epochs):
         else:
             # Anneal the learning rate if no improvement has been seen in the validation dataset.
             lr /= 4.0
-            optim.set_learning_rate(lr)
-            kv.set_optimizer(optim)
+            trainer.set_learning_rate(lr)
+        kv.push(lr_key, nd.array([lr]))
+    else:
+        kv.push(lr_key, nd.array([0]))
+        lr_arr = nd.zeros((1))
+        kv.pull(lr_key, lr_arr)
+        lr = lr_arr.asscalar() * kv.num_workers
+        trainer.set_learning_rate(lr)
 
 if kv.rank == 0:
     # Load the best saved model.
@@ -209,3 +237,4 @@ if kv.rank == 0:
     print('=' * 89)
     print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
     print('=' * 89)
+
