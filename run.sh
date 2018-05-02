@@ -15,12 +15,21 @@ dropout=0.2
 seed=1111
 log_interval=2
 save=model.pt
+cls=True
+ncls=20
 
 nvidia-smi
 hostname
 echo $CUDA_VISIBLE_DEVICES
 
-python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} \
-                   --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} \
-                   --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} \
-                   --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --cuda
+if [ "$cls" != "True" ]; then
+    python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} \
+                       --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} \
+                       --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} \
+                       --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --cuda
+else
+    python3 -u main.py --data ${data} --model ${model} --emsize ${emsize} \
+                       --nlayers ${nlayers} --lr ${lr} --clip ${clip} --dropout ${dropout} \
+                       --seed ${seed} --log-interval ${log_interval} --save ${save} --nhid ${nhid} \
+                       --epoch ${epoch} --batch_size ${batch_size} --bptt ${bptt} --cuda --cls --ncls ${ncls}
+fi

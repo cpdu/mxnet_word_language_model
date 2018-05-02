@@ -1,6 +1,7 @@
 import math
 import time
 import argparse
+from collections import defaultdict
 import mxnet as mx
 import mxnet.ndarray as nd
 from mxnet import gluon, autograd
@@ -35,7 +36,11 @@ parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
-parser.add_argument('--log-interval', type=int, default=50, metavar='N',
+parser.add_argument('--cls', action='store_true', default=True,
+                    help='use class-based training')
+parser.add_argument('--ncls', type=int, default=20,
+                    help='number of classes')
+parser.add_argument('--log-interval', type=int, default=2, metavar='N',
                     help='report interval')
 parser.add_argument('--save', type=str,  default='model.pt',
                     help='path to save the final model')
@@ -56,7 +61,7 @@ else:
 
 
 # load data
-corpus = data.Corpus(args.data)
+corpus = data.Corpus(args.data, class_num=args.cls*args.ncls)
 vocab_size = len(corpus.dictionary)
 
 def batchify(data, batch_size):
@@ -70,7 +75,7 @@ train_data = batchify(corpus.train, args.batch_size).as_in_context(context)
 val_data = batchify(corpus.valid, args.batch_size).as_in_context(context)
 test_data = batchify(corpus.test, args.batch_size).as_in_context(context)
 
-model = model.RNNModel(args.model, vocab_size, args.emsize, args.nhid, args.nlayers, args.dropout)
+model = model.RNNModel(args.model, vocab_size, args.emsize, args.nhid, args.nlayers, args.dropout, args.cls, corpus.dictionary.cls2wordnum)
 model.initialize(ctx=context)
 trainer = gluon.Trainer(model.collect_params(), 'sgd', {'learning_rate': args.lr, 'momentum': 0, 'wd': 0})
 criterion = gluon.loss.SoftmaxCrossEntropyLoss()
@@ -88,31 +93,91 @@ def get_batch(source, i):
     target = source[i + 1 : i + 1 + seq_len]
     return data, target.reshape((-1,))
 
-def evaluate(data_source):
+def classify(classes, cindices):
+    idxdict = defaultdict(lambda: [])
+    cidxdict = defaultdict(lambda: [])
+    for i, (cls, cidx) in enumerate(zip(classes, cindices)):
+        cls = cls.asscalar()
+        cidx = cidx.asscalar()
+        idxdict[cls].append(i)
+        cidxdict[cls].append(cidx)
+    cls2idxlst = []
+    cls2cidxlst = []
+    for cls in range(args.ncls):
+        cls2idxlst.append(nd.array(idxdict[cls], ctx=context))
+        cls2cidxlst.append(nd.array(cidxdict[cls], ctx=context))
+    return cls2idxlst, cls2cidxlst
+
+if args.cls:
+    idx2class = nd.array(corpus.dictionary.idx2class, ctx=context, dtype='int32')
+    idx2cidx = nd.array(corpus.dictionary.idx2cidx, ctx=context, dtype='int64')
+
+def evaluate(data_source, class_based=False):
     total_loss = 0.0
     ntotal = 0
-    hidden = model.begin_state(func = mx.nd.zeros, batch_size = args.batch_size,
-                               ctx=context)
+    hidden = model.begin_state(func = mx.nd.zeros, batch_size = args.batch_size, ctx=context)
     for i in range(0, data_source.shape[0] - 1, args.bptt):
         data, target = get_batch(data_source, i)
-        output, hidden = model(data, hidden)
-        loss = criterion(output, target)
-        total_loss += mx.nd.sum(loss).asscalar()
-        ntotal += loss.size
+        if class_based:
+            tar_classes = nd.take(idx2class, target)
+            tar_cindices = nd.take(idx2cidx, target)
+            cls2idxlst, cls2cidxlst = classify(tar_classes.as_in_context(mx.cpu()),
+                                               tar_cindices.as_in_context(mx.cpu()))
+            cls_output, word_output, hidden = model(data, hidden)
+            total_word_num = cls_output.shape[0] * cls_output.shape[1]
+            word_loss = None
+            for cls in range(args.ncls):
+                if len(cls2idxlst[cls]) == 0:
+                    continue
+                selected_output = nd.take(word_output[cls].reshape((total_word_num, -1)), cls2idxlst[cls])
+                cindices = cls2cidxlst[cls]
+                if word_loss is None:
+                    word_loss = criterion(selected_output, cindices)
+                else:
+                    word_loss = nd.concat(word_loss, criterion(selected_output, cindices), dim=0)
+            cls_loss = criterion(cls_output.reshape((-1, args.ncls)), tar_classes)
+            total_loss += nd.sum(word_loss).asscalar() + nd.sum(cls_loss).asscalar()
+            ntotal += cls_loss.size
+        else:
+            output, hidden = model(data, hidden)
+            loss = criterion(output, target)
+            total_loss += mx.nd.sum(loss).asscalar()
+            ntotal += loss.size
     return total_loss / ntotal
 
-def train():
+def train(class_based=False):
     total_loss = 0.0
     start_time = time.time()
     hidden = model.begin_state(func=mx.nd.zeros, batch_size=args.batch_size, ctx=context)
+
     for batch, i in enumerate(range(0, train_data.shape[0] - 1, args.bptt)):
         data, target = get_batch(train_data, i)
         # Starting each batch, we detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
         hidden = detach(hidden)
-        with autograd.record():
-            output, hidden = model(data, hidden)
-            loss = criterion(output, target)
+        if class_based:
+            tar_classes = nd.take(idx2class, target)
+            tar_cindices = nd.take(idx2cidx, target)
+            cls2idxlst, cls2cidxlst = classify(tar_classes.as_in_context(mx.cpu()),
+                                               tar_cindices.as_in_context(mx.cpu()))
+            with autograd.record():
+                cls_output, word_output, hidden = model(data, hidden, cls2idxlst)
+
+                word_loss = None
+                for cls in range(args.ncls):
+                    cindices = cls2cidxlst[cls]
+                    if len(cindices) == 0:
+                        continue
+                    if word_loss is not None:
+                        word_loss = nd.concat(word_loss, criterion(word_output[cls], cindices), dim=0)
+                    else:
+                        word_loss = criterion(word_output[cls], cindices)
+                cls_loss = criterion(cls_output.reshape((-1, args.ncls)), tar_classes)
+                loss = word_loss + cls_loss
+        else:
+            with autograd.record():
+                output, hidden = model(data, hidden)
+                loss = criterion(output, target)
         loss.backward()
 
         grads = [p.grad(context) for p in model.collect_params().values()]
@@ -135,10 +200,10 @@ lr = args.lr
 best_val_loss = None
 for epoch in range(args.epochs):
     epoch_start_time = time.time()
-    train()
+    train(args.cls)
     training_time = time.time() - epoch_start_time
 
-    val_loss = evaluate(val_data)
+    val_loss = evaluate(val_data, args.cls)
     print('-' * 89)
     print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | valid ppl {:8.2f}'.format(
         epoch + 1, training_time, val_loss, math.exp(val_loss)))
