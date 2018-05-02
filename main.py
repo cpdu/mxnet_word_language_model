@@ -217,7 +217,7 @@ for epoch in range(args.epochs):
 # Load the best saved model.
 model.load_params(args.save, context)
 # Run on test data.
-test_loss = evaluate(test_data)
+test_loss = evaluate(test_data, args.cls)
 
 print('=' * 89)
 print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
