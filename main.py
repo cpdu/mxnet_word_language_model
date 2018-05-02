@@ -36,7 +36,7 @@ parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
-parser.add_argument('--cls', action='store_true', default=True,
+parser.add_argument('--cls', action='store_true', 
                     help='use class-based training')
 parser.add_argument('--ncls', type=int, default=20,
                     help='number of classes')
