@@ -36,7 +36,7 @@ parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
-parser.add_argument('--cls', action='store_true', 
+parser.add_argument('--cls', action='store_true',
                     help='use class-based training')
 parser.add_argument('--ncls', type=int, default=20,
                     help='number of classes')
@@ -97,8 +97,6 @@ def classify(classes, cindices):
     idxdict = defaultdict(lambda: [])
     cidxdict = defaultdict(lambda: [])
     for i, (cls, cidx) in enumerate(zip(classes, cindices)):
-        cls = cls.asscalar()
-        cidx = cidx.asscalar()
         idxdict[cls].append(i)
         cidxdict[cls].append(cidx)
     cls2idxlst = []
@@ -121,8 +119,7 @@ def evaluate(data_source, class_based=False):
         if class_based:
             tar_classes = nd.take(idx2class, target)
             tar_cindices = nd.take(idx2cidx, target)
-            cls2idxlst, cls2cidxlst = classify(tar_classes.as_in_context(mx.cpu()),
-                                               tar_cindices.as_in_context(mx.cpu()))
+            cls2idxlst, cls2cidxlst = classify(tar_classes.asnumpy(), tar_cindices.asnumpy())
             cls_output, word_output, hidden = model(data, hidden)
             total_word_num = cls_output.shape[0] * cls_output.shape[1]
             word_loss = None
@@ -158,8 +155,7 @@ def train(class_based=False):
         if class_based:
             tar_classes = nd.take(idx2class, target)
             tar_cindices = nd.take(idx2cidx, target)
-            cls2idxlst, cls2cidxlst = classify(tar_classes.as_in_context(mx.cpu()),
-                                               tar_cindices.as_in_context(mx.cpu()))
+            cls2idxlst, cls2cidxlst = classify(tar_classes.asnumpy(), tar_cindices.asnumpy())
             with autograd.record():
                 cls_output, word_output, hidden = model(data, hidden, cls2idxlst)
 
