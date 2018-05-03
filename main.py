@@ -176,7 +176,7 @@ def train(offset):
         trainer.step(rescale)
 
         # avarage parameters from each workers
-        if batch % args.navg == 0 and batch != 0:
+        if kv.num_workers > 1 and batch % args.navg == 0 and batch != 0:
             for j, p in enumerate(model.collect_params().values()):
                 kv.push(j, p.data(), priority=-j)
             for j, p in enumerate(model.collect_params().values()):
