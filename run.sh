@@ -39,8 +39,10 @@ IFS="$OLD_IFS"
 gpu_num=${#device_list[@]}
 
 # start the scheduler
-python3 -u server.py --role scheduler --ip ${ip} --port ${port} --num-server ${num_workers} \
-                     --num-worker ${num_workers} --verbose ${verbose} &
+if [ "$rank" == "0" ]; then
+    python3 -u server.py --role scheduler --ip ${ip} --port ${port} --num-server ${num_workers} \
+                         --num-worker ${num_workers} --verbose ${verbose} &
+fi                     
 
 # start servers and workers
 i=0
